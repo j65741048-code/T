@@ -1,0 +1,368 @@
+# ============================================================================
+# Ship Launcher - one-file APK builder
+#
+# Put this file in your GitHub repo at:  .github/workflows/build-ships-launcher.yml
+# Then: Actions tab -> "Build Ship Launcher APK" -> Run workflow.
+# When it finishes, download the "ship-launcher-apk" artifact (contains the APK).
+#
+# What it does:
+#   1. Pulls the upstream ZalithLauncher2 source (GPL-3.0, Kotlin + Compose)
+#   2. Adds a custom animated background: random 2D blocky ships that sail
+#      across the screen and sink (drawn on one Canvas, capped at 30 FPS,
+#      zero work when the launcher is not on screen)
+#   3. Builds the release APK with R8 (upstream already enables it)
+#   4. Signs it with a generated key so it installs on your phone
+#
+# License note: ZalithLauncher2 is GPL-3.0 and its copyright notices must stay.
+# If you share the APK, the source (this repo) must be available too.
+# ============================================================================
+name: Build Ship Launcher APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ZalithLauncher2 branch or tag"
+        default: "main"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout upstream ZalithLauncher2
+        uses: actions/checkout@v4
+        with:
+          repository: ZalithLauncher/ZalithLauncher2
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          path: src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Gradle and Android SDK
+        run: |
+          mkdir -p ~/.gradle
+          printf '%s\n' 'org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8' 'org.gradle.parallel=true' 'org.gradle.daemon=false' >> ~/.gradle/gradle.properties
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Add sinking ships background
+        working-directory: src
+        run: |
+          MAIN=$(grep -rl "setContent" --include=MainActivity.kt . | grep -v /build/ | head -1 || true)
+          if [ -z "$MAIN" ]; then
+            echo "::warning::MainActivity with setContent not found - building stock launcher without ships"
+            exit 0
+          fi
+          MODULE="${MAIN%%/src/main/*}"
+          DEST="$MODULE/src/main/java/net/shipsink"
+          mkdir -p "$DEST"
+          cat > "$DEST/ShipsBackground.kt" << 'KT'
+          package net.shipsink
+
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableLongStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.runtime.withFrameNanos
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.drawWithCache
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.drawscope.DrawScope
+          import androidx.compose.ui.graphics.drawscope.rotate
+          import kotlin.math.abs
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+          import kotlin.math.sin
+          import kotlin.random.Random
+
+          private class Ship {
+              var state = 0          // 0 = waiting off-screen, 1 = sailing, 2 = sinking
+              var x = 0f             // center, in screen blocks
+              var dir = 1f
+              var speed = 5f
+              var scale = 1f
+              var sinkX = 0f
+              var survives = false
+              var timer = 0f
+              var tilt = 0f
+              var tiltDir = 1f
+              var drop = 0f          // blocks below the surface
+              var palette = 0
+          }
+
+          private class World {
+              val rnd = Random(System.nanoTime())
+              val ships = Array(4) { i -> Ship().apply { timer = i * 2.5f } }
+              var time = 0f
+              var wBlocks = 60f
+              val starX = FloatArray(40) { rnd.nextFloat() }
+              val starY = FloatArray(40) { rnd.nextFloat() }
+              val starP = FloatArray(40) { rnd.nextFloat() * 6.28f }
+              val bx = FloatArray(40)
+              val by = FloatArray(40)
+              val bl = FloatArray(40)
+              private var bi = 0
+
+              private fun addBubble(x: Float, y: Float) {
+                  bx[bi] = x; by[bi] = y; bl[bi] = 1.5f + rnd.nextFloat()
+                  bi = (bi + 1) % bx.size
+              }
+
+              private fun spawn(s: Ship) {
+                  s.dir = if (rnd.nextBoolean()) 1f else -1f
+                  s.scale = SCALES[rnd.nextInt(SCALES.size)]
+                  s.speed = 3.5f + rnd.nextFloat() * 3f
+                  s.x = if (s.dir > 0f) -9f else wBlocks + 9f
+                  s.survives = rnd.nextFloat() < 0.25f
+                  s.sinkX = wBlocks * (0.2f + rnd.nextFloat() * 0.6f)
+                  s.palette = rnd.nextInt(PALETTES.size)
+                  s.tilt = 0f; s.drop = 0f; s.state = 1
+              }
+
+              fun update(dt: Float) {
+                  time += dt
+                  for (s in ships) {
+                      when (s.state) {
+                          0 -> {
+                              s.timer -= dt
+                              if (s.timer <= 0f) spawn(s)
+                          }
+                          1 -> {
+                              s.x += s.dir * s.speed * dt
+                              val hit = !s.survives &&
+                                  ((s.dir > 0f && s.x >= s.sinkX) || (s.dir < 0f && s.x <= s.sinkX))
+                              if (hit) {
+                                  s.state = 2
+                                  s.timer = 0f
+                                  s.tiltDir = if (rnd.nextBoolean()) 1f else -1f
+                              } else if (s.x < -10f || s.x > wBlocks + 10f) {
+                                  s.state = 0
+                                  s.timer = 1f + rnd.nextFloat() * 3f
+                              }
+                          }
+                          else -> {
+                              s.timer += dt
+                              s.tilt = (s.tilt + s.tiltDir * (8f + s.timer * 6f) * dt).coerceIn(-85f, 85f)
+                              s.drop += (1.2f + s.timer * 1.1f) * dt
+                              s.x += s.dir * s.speed * 0.15f * dt
+                              if (rnd.nextFloat() < dt * 14f) {
+                                  addBubble(s.x + (rnd.nextFloat() - 0.5f) * 4f * s.scale, -s.drop + 1f)
+                              }
+                              if (s.drop > 16f) {
+                                  s.state = 0
+                                  s.timer = 1f + rnd.nextFloat() * 3f
+                                  s.tilt = 0f; s.drop = 0f
+                              }
+                          }
+                      }
+                  }
+                  for (i in bl.indices) {
+                      if (bl[i] > 0f) {
+                          bl[i] -= dt
+                          by[i] += 3f * dt
+                          bx[i] += sin(time * 3f + i) * 0.4f * dt
+                          if (by[i] > 0f) bl[i] = 0f
+                      }
+                  }
+              }
+          }
+
+          private val SCALES = floatArrayOf(0.6f, 0.8f, 1f)
+
+          private val PALETTES = arrayOf(
+              arrayOf(Color(0xFF5B3A1E), Color(0xFF8B5A2B), Color(0xFFEDE6D3), Color(0xFFC0392B)),
+              arrayOf(Color(0xFF3E2A1A), Color(0xFF6F4E37), Color(0xFFD9D2C0), Color(0xFF2E86C1)),
+              arrayOf(Color(0xFF4A3B2A), Color(0xFF9C6B3A), Color(0xFFF4EBD0), Color(0xFFF1C40F))
+          )
+          private val SAIL_SHADE = Color(0x22000000)
+
+          // x, y(up), width, height, colour index (0 wood, 1 deck, 2 sail, 3 flag, 4 shade)
+          private val SHIP = arrayOf(
+              intArrayOf(2, 0, 7, 1, 0),
+              intArrayOf(1, 1, 9, 1, 0),
+              intArrayOf(0, 2, 11, 1, 1),
+              intArrayOf(0, 3, 2, 1, 0),
+              intArrayOf(10, 3, 1, 2, 0),
+              intArrayOf(2, 4, 7, 7, 2),
+              intArrayOf(2, 7, 7, 1, 4),
+              intArrayOf(5, 3, 1, 10, 0),
+              intArrayOf(1, 11, 9, 1, 1),
+              intArrayOf(6, 12, 3, 1, 3)
+          )
+
+          private val MOON_ROWS = intArrayOf(1, 2, 3, 3, 3, 2, 1)
+
+          private fun DrawScope.drawShip(s: Ship, b: Float, seaY: Float) {
+              val bs = b * s.scale
+              val cx = s.x * b
+              val baseY = seaY + bs * 1.2f + s.drop * b
+              val pal = PALETTES[s.palette]
+              rotate(s.tilt, Offset(cx, baseY - bs * 2f)) {
+                  for (r in SHIP) {
+                      val x0 = if (s.dir > 0f) r[0] else 11 - r[0] - r[2]
+                      val color = when (r[4]) {
+                          0 -> pal[0]
+                          1 -> pal[1]
+                          2 -> pal[2]
+                          3 -> pal[3]
+                          else -> SAIL_SHADE
+                      }
+                      drawRect(
+                          color,
+                          Offset(cx + (x0 - 5.5f) * bs, baseY - (r[1] + r[3]) * bs),
+                          Size(r[2] * bs + 0.5f, r[3] * bs + 0.5f)
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun ShipsLayer() {
+              val world = remember { World() }
+              var tick by remember { mutableLongStateOf(0L) }
+
+              LaunchedEffect(Unit) {
+                  var last = 0L
+                  while (true) {
+                      withFrameNanos { now ->
+                          if (last == 0L) last = now
+                          val dt = (now - last) / 1_000_000_000f
+                          if (dt >= 1f / 30f) {   // 30 FPS cap keeps the launcher light
+                              last = now
+                              world.update(min(dt, 0.1f))
+                              tick = now
+                          }
+                      }
+                  }
+              }
+
+              Box(
+                  Modifier.fillMaxSize().drawWithCache {
+                      val w = size.width
+                      val h = size.height
+                      val b = h / 30f
+                      val seaY = h * 0.6f
+                      world.wBlocks = w / b
+                      val sky = Brush.verticalGradient(
+                          listOf(Color(0xFF070B24), Color(0xFF16345A), Color(0xFF3A6B8C)), 0f, seaY
+                      )
+                      val sea = Brush.verticalGradient(
+                          listOf(Color(0xFF1E5F86), Color(0xFF0B2A45), Color(0xFF06182B)), seaY, h
+                      )
+                      val cols = (w / b).toInt() + 2
+                      val front = seaY + b * 0.3f
+                      onDrawBehind {
+                          @Suppress("UNUSED_VARIABLE") val frame = tick
+                          val t = world.time
+
+                          drawRect(sky, size = Size(w, seaY))
+                          for (i in world.starX.indices) {
+                              val a = 0.4f + 0.6f * abs(sin(t * 0.8f + world.starP[i]))
+                              drawRect(
+                                  Color.White.copy(alpha = a),
+                                  Offset(world.starX[i] * w, world.starY[i] * seaY * 0.7f),
+                                  Size(b * 0.3f, b * 0.3f)
+                              )
+                          }
+                          val mx = w * 0.82f
+                          val my = h * 0.17f
+                          val mu = b * 0.6f
+                          for (r in MOON_ROWS.indices) {
+                              val hw = MOON_ROWS[r]
+                              drawRect(
+                                  Color(0xFFF3EFD2),
+                                  Offset(mx - hw * mu, my + (r - 3) * mu),
+                                  Size(2 * hw * mu, mu)
+                              )
+                          }
+
+                          drawRect(sea, Offset(0f, seaY), Size(w, h - seaY))
+                          for (i in 0 until cols) {
+                              val k = (sin(i * 0.55f + t * 1.4f) * 1.4f).roundToInt()
+                              drawRect(
+                                  Color(0x55BFE3F2),
+                                  Offset(i * b, seaY + k * b * 0.5f - b * 0.5f),
+                                  Size(b, b * 0.5f)
+                              )
+                          }
+
+                          for (s in world.ships) if (s.state != 0) drawShip(s, b, seaY)
+
+                          drawRect(Color(0x88104A6E), Offset(0f, front), Size(w, h - front))
+                          for (i in 0 until cols) {
+                              val k = (sin(i * 0.6f - t * 1.7f + 1.3f) * 1.4f).roundToInt()
+                              drawRect(
+                                  Color(0x99D8F1FA),
+                                  Offset(i * b, front + k * b * 0.5f - b * 0.5f),
+                                  Size(b, b * 0.5f)
+                              )
+                          }
+
+                          for (i in world.bl.indices) {
+                              if (world.bl[i] > 0f) {
+                                  drawRect(
+                                      Color(0xAAE8F8FF),
+                                      Offset(world.bx[i] * b, seaY - world.by[i] * b),
+                                      Size(b * 0.3f, b * 0.3f)
+                                  )
+                              }
+                          }
+                      }
+                  }
+              ) {}
+          }
+          KT
+          python3 - "$MAIN" << 'PY'
+          import re, sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text(encoding="utf-8")
+          if "ShipsLayer" in s:
+              print("already patched")
+          else:
+              s2, n = re.subn(r"setContent\s*\{", "setContent {\n            net.shipsink.ShipsLayer()", s, count=1)
+              if n == 0:
+                  print("::warning::could not patch setContent")
+              else:
+                  p.write_text(s2, encoding="utf-8")
+                  print("patched", p)
+          PY
+
+      - name: Build release APK
+        working-directory: src
+        env:
+          CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace || ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Sign APK
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          keytool -genkeypair -keystore ks.jks -alias ship -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android -dname "CN=ShipLauncher"
+          mkdir -p out
+          find src -path '*/build/outputs/apk/*' -name '*.apk' | while read -r f; do
+            n=$(basename "$f" .apk)
+            "$BT/zipalign" -p 4 "$f" "out/$n-aligned.apk"
+            "$BT/apksigner" sign --ks ks.jks --ks-pass pass:android --key-pass pass:android \
+              --out "out/ShipLauncher-$n.apk" "out/$n-aligned.apk"
+            rm "out/$n-aligned.apk"
+          done
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ship-launcher-apk
+          path: out/*.apk
