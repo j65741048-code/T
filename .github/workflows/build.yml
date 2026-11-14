@@ -108,6 +108,7 @@ jobs:
               }
               compileOnly("net.createmod.ponder:Ponder-NeoForge-1.21.1:1.0.+")
               compileOnly("dev.engine-room.flywheel:flywheel-neoforge-api-1.21.1:1.0.+")
+              compileOnly("dev.engine-room.flywheel:flywheel-neoforge-1.21.1:1.0.+")
               compileOnly("com.tterrag.registrate:Registrate:MC1.21-1.3.+")
           }
 
@@ -169,6 +170,7 @@ jobs:
             "client": [
               "client.BogeyBlockEntityRendererMixin",
               "client.BogeyRendererMixin",
+              "client.CachedBuffersMixin",
               "client.SuperByteBufferMixin",
               "client.TrackRendererMixin",
               "client.TrackVisualMixin"
@@ -403,10 +405,11 @@ jobs:
                       }
 
                       // 1. Traverse all logical track node connections (straight, diagonal, switches, slopes)
-                      Collection<TrackNodeLocation.DiscoveredLocation> connectedNodes =
+                      Collection<? extends TrackNodeLocation> connectedNodes =
                           trackBlock.getConnected(level, current, state, true, null);
-                      for (TrackNodeLocation.DiscoveredLocation nodeLoc : connectedNodes) {
-                          BlockPos candidate = BlockPos.containing(nodeLoc).immutable();
+                      for (TrackNodeLocation nodeLoc : connectedNodes) {
+                          Vec3 vec = nodeLoc.getLocation();
+                          BlockPos candidate = BlockPos.containing(vec).immutable();
                           enqueueIfTrack(level, candidate, visited, queue);
                           enqueueIfTrack(level, candidate.above(), visited, queue);
                           enqueueIfTrack(level, candidate.below(), visited, queue);
@@ -843,19 +846,13 @@ jobs:
 
           import com.createdyedtracks.RenderColorContext;
           import com.mojang.blaze3d.vertex.PoseStack;
-          import com.simibubi.create.AllPartialModels;
           import com.simibubi.create.content.trains.bogey.BogeyRenderer;
-          import dev.engine_room.flywheel.lib.model.baked.PartialModel;
-          import net.createmod.catnip.render.CachedBuffers;
-          import net.createmod.catnip.render.SuperByteBuffer;
           import net.minecraft.client.renderer.MultiBufferSource;
           import net.minecraft.nbt.CompoundTag;
           import net.minecraft.world.item.DyeColor;
-          import net.minecraft.world.level.block.state.BlockState;
           import org.spongepowered.asm.mixin.Mixin;
           import org.spongepowered.asm.mixin.injection.At;
           import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.Redirect;
           import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
           @Mixin(BogeyRenderer.class)
@@ -875,33 +872,63 @@ jobs:
                   }
               }
 
-              @Redirect(
-                  method = "*",
-                  at = @At(
-                      value = "INVOKE",
-                      target = "Lnet/createmod/catnip/render/CachedBuffers;partial(Ldev/engine_room/flywheel/lib/model/baked/PartialModel;Lnet/minecraft/world/level/block/state/BlockState;)Lnet/createmod/catnip/render/SuperByteBuffer;"
-                  ),
+              @Inject(method = "render", at = @At("RETURN"), remap = false, require = 0)
+              private void createdyedtracks$clearBogeyDataColor(
+                  CompoundTag bogeyData, float wheelAngle, float partialTick,
+                  PoseStack poseStack, MultiBufferSource bufferSource,
+                  int packedLight, int packedOverlay, boolean inContraption, CallbackInfo ci
+              ) {
+                  RenderColorContext.setBogeyColor(null);
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/client/CachedBuffersMixin.java
+          package com.createdyedtracks.mixin.client;
+
+          import com.createdyedtracks.RenderColorContext;
+          import com.simibubi.create.AllPartialModels;
+          import dev.engine_room.flywheel.lib.model.baked.PartialModel;
+          import net.createmod.catnip.render.CachedBuffers;
+          import net.createmod.catnip.render.SuperByteBuffer;
+          import net.minecraft.world.item.DyeColor;
+          import net.minecraft.world.level.block.state.BlockState;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          import java.util.Locale;
+
+          @Mixin(CachedBuffers.class)
+          public class CachedBuffersMixin {
+
+              @Inject(
+                  method = "partial(Ldev/engine_room/flywheel/lib/model/baked/PartialModel;Lnet/minecraft/world/level/block/state/BlockState;)Lnet/createmod/catnip/render/SuperByteBuffer;",
+                  at = @At("RETURN"),
                   remap = false,
                   require = 0
               )
-              private SuperByteBuffer createdyedtracks$tintBogeyWheelsOnly(PartialModel partial, BlockState state) {
-                  SuperByteBuffer buffer = CachedBuffers.partial(partial, state);
+              private static void createdyedtracks$tintBogeyWheelsOnly(
+                  PartialModel partial, BlockState referenceState, CallbackInfoReturnable<SuperByteBuffer> cir
+              ) {
                   DyeColor color = RenderColorContext.getBogeyColor();
                   if (color != null && createdyedtracks$isWheelPartial(partial)) {
-                      buffer.color(RenderColorContext.getVibrantRgb(color));
+                      SuperByteBuffer buffer = cir.getReturnValue();
+                      if (buffer != null) {
+                          buffer.color(RenderColorContext.getVibrantRgb(color));
+                      }
                   }
-                  return buffer;
               }
 
               private static boolean createdyedtracks$isWheelPartial(PartialModel partial) {
                   if (partial == null) return false;
                   if (partial == AllPartialModels.SMALL_BOGEY_WHEELS
-                      || partial == AllPartialModels.LARGE_BOGEY_WHEELS
-                      || partial == AllPartialModels.BOGEY_DRIVE) {
+                      || partial == AllPartialModels.LARGE_BOGEY_WHEELS) {
                       return true;
                   }
-                  String path = partial.modelLocation().getPath();
-                  return path.contains("wheel") || path.contains("drive");
+                  String desc = partial.toString().toLowerCase(Locale.ROOT);
+                  return desc.contains("wheel") || desc.contains("drive");
               }
           }
           EOF
@@ -950,19 +977,19 @@ jobs:
           import com.createdyedtracks.RenderColorContext;
           import com.simibubi.create.content.trains.track.TrackBlockEntity;
           import com.simibubi.create.content.trains.track.TrackVisual;
-          import org.spongepowered.asm.mixin.Final;
+          import dev.engine_room.flywheel.api.visualization.VisualizationContext;
+          import dev.engine_room.flywheel.lib.visual.AbstractBlockEntityVisual;
           import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.Shadow;
           import org.spongepowered.asm.mixin.injection.At;
           import org.spongepowered.asm.mixin.injection.Inject;
           import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
           @Mixin(TrackVisual.class)
-          public class TrackVisualMixin {
+          public abstract class TrackVisualMixin extends AbstractBlockEntityVisual<TrackBlockEntity> {
 
-              @Shadow(remap = false)
-              @Final
-              private TrackBlockEntity blockEntity;
+              public TrackVisualMixin(VisualizationContext context, TrackBlockEntity blockEntity, float partialTick) {
+                  super(context, blockEntity, partialTick);
+              }
 
               @Inject(method = "update", at = @At("HEAD"), remap = false, require = 0)
               private void createdyedtracks$beginVisualUpdate(float pt, CallbackInfo ci) {
@@ -1009,7 +1036,7 @@ jobs:
           EOF
 
       - name: Build Mod JAR
-        run: gradle build --no-daemon
+        run: gradle build --no-daemon --stacktrace
 
       - name: Upload Compiled Mod JAR
         uses: actions/upload-artifact@v4
