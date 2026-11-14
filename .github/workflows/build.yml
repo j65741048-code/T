@@ -1,1046 +1,368 @@
-name: Build Create Dyed Bogies & Tracks (1.21.1 NeoForge)
+# ============================================================================
+# Ship Launcher - one-file APK builder
+#
+# Put this file in your GitHub repo at:  .github/workflows/build-ships-launcher.yml
+# Then: Actions tab -> "Build Ship Launcher APK" -> Run workflow.
+# When it finishes, download the "ship-launcher-apk" artifact (contains the APK).
+#
+# What it does:
+#   1. Pulls the upstream ZalithLauncher2 source (GPL-3.0, Kotlin + Compose)
+#   2. Adds a custom animated background: random 2D blocky ships that sail
+#      across the screen and sink (drawn on one Canvas, capped at 30 FPS,
+#      zero work when the launcher is not on screen)
+#   3. Builds the release APK with R8 (upstream already enables it)
+#   4. Signs it with a generated key so it installs on your phone
+#
+# License note: ZalithLauncher2 is GPL-3.0 and its copyright notices must stay.
+# If you share the APK, the source (this repo) must be available too.
+# ============================================================================
+name: Build Ship Launcher APK
 
 on:
-  push:
   workflow_dispatch:
-
-permissions:
-  contents: read
+    inputs:
+      ref:
+        description: "Upstream ZalithLauncher2 branch or tag"
+        default: "main"
+        required: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 90
     steps:
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - name: Checkout upstream ZalithLauncher2
+        uses: actions/checkout@v4
         with:
-          java-version: '21'
-          distribution: 'temurin'
+          repository: ZalithLauncher/ZalithLauncher2
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          path: src
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: actions/setup-java@v4
         with:
-          gradle-version: '8.10.2'
+          distribution: temurin
+          java-version: "17"
 
-      - name: Generate Mod Project Structure
+      - name: Prepare Gradle and Android SDK
         run: |
-          mkdir -p src/main/java/com/createdyedtracks/client
-          mkdir -p src/main/java/com/createdyedtracks/mixin/client
-          mkdir -p src/main/resources/META-INF
+          mkdir -p ~/.gradle
+          printf '%s\n' 'org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8' 'org.gradle.parallel=true' 'org.gradle.daemon=false' >> ~/.gradle/gradle.properties
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
-          cat << 'EOF' > settings.gradle
-          pluginManagement {
-              repositories {
-                  gradlePluginPortal()
-                  mavenCentral()
-                  maven { url = 'https://maven.neoforged.net/releases' }
-              }
+      - name: Add sinking ships background
+        working-directory: src
+        run: |
+          MAIN=$(grep -rl "setContent" --include=MainActivity.kt . | grep -v /build/ | head -1 || true)
+          if [ -z "$MAIN" ]; then
+            echo "::warning::MainActivity with setContent not found - building stock launcher without ships"
+            exit 0
+          fi
+          MODULE="${MAIN%%/src/main/*}"
+          DEST="$MODULE/src/main/java/net/shipsink"
+          mkdir -p "$DEST"
+          cat > "$DEST/ShipsBackground.kt" << 'KT'
+          package net.shipsink
+
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableLongStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.runtime.withFrameNanos
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.drawWithCache
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.drawscope.DrawScope
+          import androidx.compose.ui.graphics.drawscope.rotate
+          import kotlin.math.abs
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+          import kotlin.math.sin
+          import kotlin.random.Random
+
+          private class Ship {
+              var state = 0          // 0 = waiting off-screen, 1 = sailing, 2 = sinking
+              var x = 0f             // center, in screen blocks
+              var dir = 1f
+              var speed = 5f
+              var scale = 1f
+              var sinkX = 0f
+              var survives = false
+              var timer = 0f
+              var tilt = 0f
+              var tiltDir = 1f
+              var drop = 0f          // blocks below the surface
+              var palette = 0
           }
 
-          plugins {
-              id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
-          }
+          private class World {
+              val rnd = Random(System.nanoTime())
+              val ships = Array(4) { i -> Ship().apply { timer = i * 2.5f } }
+              var time = 0f
+              var wBlocks = 60f
+              val starX = FloatArray(40) { rnd.nextFloat() }
+              val starY = FloatArray(40) { rnd.nextFloat() }
+              val starP = FloatArray(40) { rnd.nextFloat() * 6.28f }
+              val bx = FloatArray(40)
+              val by = FloatArray(40)
+              val bl = FloatArray(40)
+              private var bi = 0
 
-          rootProject.name = 'createdyedtracks'
-          EOF
-
-          cat << 'EOF' > gradle.properties
-          org.gradle.jvmargs=-Xmx3G
-          org.gradle.daemon=false
-          org.gradle.caching=true
-          EOF
-
-          cat << 'EOF' > build.gradle
-          plugins {
-              id 'java-library'
-              id 'maven-publish'
-              id 'net.neoforged.moddev' version '2.0.78'
-          }
-
-          version = '1.0.0'
-          group = 'com.createdyedtracks'
-
-          base {
-              archivesName = 'createdyedtracks-1.21.1-neoforge'
-          }
-
-          java.toolchain.languageVersion = JavaLanguageVersion.of(21)
-
-          neoForge {
-              version = '21.1.133'
-
-              parchment {
-                  mappingsVersion = '2024.11.17'
-                  minecraftVersion = '1.21.1'
+              private fun addBubble(x: Float, y: Float) {
+                  bx[bi] = x; by[bi] = y; bl[bi] = 1.5f + rnd.nextFloat()
+                  bi = (bi + 1) % bx.size
               }
 
-              mods {
-                  createdyedtracks {
-                      sourceSet(sourceSets.main)
-                  }
-              }
-          }
-
-          repositories {
-              mavenCentral()
-              maven {
-                  name = 'Create Maven'
-                  url = 'https://maven.createmod.net'
-              }
-              maven {
-                  name = 'ithundxr Mirror'
-                  url = 'https://maven.ithundxr.dev/mirror'
-              }
-              maven {
-                  name = 'devOS Snapshots'
-                  url = 'https://mvn.devos.one/snapshots'
-              }
-              maven {
-                  name = 'devOS Releases'
-                  url = 'https://mvn.devos.one/releases'
-              }
-          }
-
-          dependencies {
-              compileOnly("com.simibubi.create:create-1.21.1:6.0.+") {
-                  transitive = false
-              }
-              compileOnly("net.createmod.ponder:Ponder-NeoForge-1.21.1:1.0.+")
-              compileOnly("dev.engine-room.flywheel:flywheel-neoforge-api-1.21.1:1.0.+")
-              compileOnly("dev.engine-room.flywheel:flywheel-neoforge-1.21.1:1.0.+")
-              compileOnly("com.tterrag.registrate:Registrate:MC1.21-1.3.+")
-          }
-
-          tasks.withType(JavaCompile).configureEach {
-              options.encoding = 'UTF-8'
-          }
-          EOF
-
-          cat << 'EOF' > src/main/resources/META-INF/neoforge.mods.toml
-          modLoader="javafml"
-          loaderVersion="[4,)"
-          license="MIT"
-
-          [[mods]]
-          modId="createdyedtracks"
-          version="1.0.0"
-          displayName="Create: Dyed Bogies & Tracks"
-          authors="CreateDyedTracks"
-          description='''
-          Dye Create train bogey wheels and entire connected railway track lines with any Minecraft dye.
-          '''
-
-          [[mixins]]
-          config="createdyedtracks.mixins.json"
-
-          [[dependencies.createdyedtracks]]
-          modId="neoforge"
-          type="required"
-          versionRange="[21.1,)"
-          ordering="NONE"
-          side="BOTH"
-
-          [[dependencies.createdyedtracks]]
-          modId="minecraft"
-          type="required"
-          versionRange="[1.21.1,1.22)"
-          ordering="NONE"
-          side="BOTH"
-
-          [[dependencies.createdyedtracks]]
-          modId="create"
-          type="required"
-          versionRange="[6.0.0,)"
-          ordering="AFTER"
-          side="BOTH"
-          EOF
-
-          cat << 'EOF' > src/main/resources/createdyedtracks.mixins.json
-          {
-            "required": true,
-            "minVersion": "0.8",
-            "package": "com.createdyedtracks.mixin",
-            "compatibilityLevel": "JAVA_21",
-            "mixins": [
-              "AbstractBogeyBlockEntityMixin",
-              "CarriageBogeyMixin",
-              "TrackBlockEntityMixin"
-            ],
-            "client": [
-              "client.BogeyBlockEntityRendererMixin",
-              "client.BogeyRendererMixin",
-              "client.CachedBuffersMixin",
-              "client.SuperByteBufferMixin",
-              "client.TrackRendererMixin",
-              "client.TrackVisualMixin"
-            ],
-            "injectors": {
-              "defaultRequire": 0
-            }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/CreateDyedTracksMod.java
-          package com.createdyedtracks;
-
-          import net.neoforged.bus.api.IEventBus;
-          import net.neoforged.fml.common.Mod;
-          import net.neoforged.neoforge.common.NeoForge;
-          import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
-          import net.neoforged.neoforge.network.registration.PayloadRegistrar;
-
-          @Mod(CreateDyedTracksMod.MOD_ID)
-          public class CreateDyedTracksMod {
-              public static final String MOD_ID = "createdyedtracks";
-
-              public CreateDyedTracksMod(IEventBus modEventBus) {
-                  modEventBus.addListener(this::registerPayloads);
-                  NeoForge.EVENT_BUS.register(new DyeInteractionHandler());
+              private fun spawn(s: Ship) {
+                  s.dir = if (rnd.nextBoolean()) 1f else -1f
+                  s.scale = SCALES[rnd.nextInt(SCALES.size)]
+                  s.speed = 3.5f + rnd.nextFloat() * 3f
+                  s.x = if (s.dir > 0f) -9f else wBlocks + 9f
+                  s.survives = rnd.nextFloat() < 0.25f
+                  s.sinkX = wBlocks * (0.2f + rnd.nextFloat() * 0.6f)
+                  s.palette = rnd.nextInt(PALETTES.size)
+                  s.tilt = 0f; s.drop = 0f; s.state = 1
               }
 
-              private void registerPayloads(RegisterPayloadHandlersEvent event) {
-                  PayloadRegistrar registrar = event.registrar("1");
-                  registrar.playToClient(
-                      SyncDyeColorPayload.TYPE,
-                      SyncDyeColorPayload.STREAM_CODEC,
-                      SyncDyeColorPayload::handleClient
-                  );
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/ColorHolder.java
-          package com.createdyedtracks;
-
-          import net.minecraft.world.item.DyeColor;
-          import org.jetbrains.annotations.Nullable;
-
-          public interface ColorHolder {
-              @Nullable
-              DyeColor createdyedtracks$getDyedColor();
-
-              void createdyedtracks$setDyedColor(@Nullable DyeColor color);
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/RenderColorContext.java
-          package com.createdyedtracks;
-
-          import net.minecraft.world.item.DyeColor;
-          import org.jetbrains.annotations.Nullable;
-
-          public final class RenderColorContext {
-              private static final ThreadLocal<DyeColor> ACTIVE_BOGEY_COLOR = new ThreadLocal<>();
-              private static final ThreadLocal<DyeColor> ACTIVE_TRACK_COLOR = new ThreadLocal<>();
-
-              private RenderColorContext() {}
-
-              public static void setBogeyColor(@Nullable DyeColor color) {
-                  if (color == null) {
-                      ACTIVE_BOGEY_COLOR.remove();
-                  } else {
-                      ACTIVE_BOGEY_COLOR.set(color);
-                  }
-              }
-
-              @Nullable
-              public static DyeColor getBogeyColor() {
-                  return ACTIVE_BOGEY_COLOR.get();
-              }
-
-              public static void setTrackColor(@Nullable DyeColor color) {
-                  if (color == null) {
-                      ACTIVE_TRACK_COLOR.remove();
-                  } else {
-                      ACTIVE_TRACK_COLOR.set(color);
-                  }
-              }
-
-              @Nullable
-              public static DyeColor getTrackColor() {
-                  return ACTIVE_TRACK_COLOR.get();
-              }
-
-              public static int getVibrantRgb(DyeColor color) {
-                  return color.getTextureDiffuseColor();
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/client/ClientPacketHandler.java
-          package com.createdyedtracks.client;
-
-          import com.createdyedtracks.ColorHolder;
-          import com.createdyedtracks.SyncDyeColorPayload;
-          import net.minecraft.client.Minecraft;
-          import net.minecraft.world.item.DyeColor;
-          import net.minecraft.world.level.Level;
-          import net.minecraft.world.level.block.entity.BlockEntity;
-
-          public final class ClientPacketHandler {
-              private ClientPacketHandler() {}
-
-              public static void handleSyncDyeColor(SyncDyeColorPayload payload) {
-                  Minecraft mc = Minecraft.getInstance();
-                  Level level = mc.level;
-                  if (level == null || !level.isLoaded(payload.pos())) {
-                      return;
-                  }
-                  BlockEntity be = level.getBlockEntity(payload.pos());
-                  if (be instanceof ColorHolder holder) {
-                      DyeColor dyeColor = payload.colorId() < 0 ? null : DyeColor.byId(payload.colorId());
-                      holder.createdyedtracks$setDyedColor(dyeColor);
-                      level.sendBlockUpdated(payload.pos(), be.getBlockState(), be.getBlockState(), 3);
-                  }
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/SyncDyeColorPayload.java
-          package com.createdyedtracks;
-
-          import com.createdyedtracks.client.ClientPacketHandler;
-          import io.netty.buffer.ByteBuf;
-          import net.minecraft.core.BlockPos;
-          import net.minecraft.network.codec.ByteBufCodecs;
-          import net.minecraft.network.codec.StreamCodec;
-          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
-          import net.minecraft.resources.ResourceLocation;
-          import net.minecraft.world.item.DyeColor;
-          import net.neoforged.neoforge.network.handling.IPayloadContext;
-          import org.jetbrains.annotations.Nullable;
-
-          public record SyncDyeColorPayload(BlockPos pos, int colorId) implements CustomPacketPayload {
-              public static final Type<SyncDyeColorPayload> TYPE =
-                  new Type<>(ResourceLocation.fromNamespaceAndPath(CreateDyedTracksMod.MOD_ID, "sync_dye_color"));
-
-              public static final StreamCodec<ByteBuf, SyncDyeColorPayload> STREAM_CODEC = StreamCodec.composite(
-                  BlockPos.STREAM_CODEC,
-                  SyncDyeColorPayload::pos,
-                  ByteBufCodecs.VAR_INT,
-                  SyncDyeColorPayload::colorId,
-                  SyncDyeColorPayload::new
-              );
-
-              public static SyncDyeColorPayload of(BlockPos pos, @Nullable DyeColor color) {
-                  return new SyncDyeColorPayload(pos, color == null ? -1 : color.getId());
-              }
-
-              @Override
-              public Type<? extends CustomPacketPayload> type() {
-                  return TYPE;
-              }
-
-              public static void handleClient(SyncDyeColorPayload payload, IPayloadContext context) {
-                  context.enqueueWork(() -> ClientPacketHandler.handleSyncDyeColor(payload));
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/TrackNetworkColorer.java
-          package com.createdyedtracks;
-
-          import com.simibubi.create.content.trains.graph.TrackNodeLocation;
-          import com.simibubi.create.content.trains.track.BezierConnection;
-          import com.simibubi.create.content.trains.track.ITrackBlock;
-          import com.simibubi.create.content.trains.track.TrackBlockEntity;
-          import net.minecraft.core.BlockPos;
-          import net.minecraft.server.level.ServerLevel;
-          import net.minecraft.world.item.DyeColor;
-          import net.minecraft.world.level.Level;
-          import net.minecraft.world.level.block.entity.BlockEntity;
-          import net.minecraft.world.level.block.state.BlockState;
-          import net.minecraft.world.phys.Vec3;
-          import net.neoforged.neoforge.network.PacketDistributor;
-
-          import java.util.ArrayDeque;
-          import java.util.Collection;
-          import java.util.HashSet;
-          import java.util.Map;
-          import java.util.Queue;
-          import java.util.Set;
-
-          public final class TrackNetworkColorer {
-              private static final int MAX_TRACK_SEGMENTS = 16384;
-
-              private TrackNetworkColorer() {}
-
-              public static int colorSingleTrack(Level level, BlockPos pos, DyeColor color) {
-                  int updated = 0;
-                  if (applyColorToPos(level, pos, color)) {
-                      updated++;
-                  }
-                  BlockEntity be = level.getBlockEntity(pos);
-                  if (be instanceof TrackBlockEntity trackBE) {
-                      for (BlockPos connectedPos : trackBE.getConnections().keySet()) {
-                          if (applyColorToPos(level, connectedPos, color)) {
-                              updated++;
+              fun update(dt: Float) {
+                  time += dt
+                  for (s in ships) {
+                      when (s.state) {
+                          0 -> {
+                              s.timer -= dt
+                              if (s.timer <= 0f) spawn(s)
                           }
-                      }
-                  }
-                  return updated;
-              }
-
-              public static int colorConnectedLine(Level level, BlockPos startPos, DyeColor color) {
-                  Set<BlockPos> visited = new HashSet<>();
-                  Queue<BlockPos> queue = new ArrayDeque<>();
-
-                  BlockPos immutableStart = startPos.immutable();
-                  visited.add(immutableStart);
-                  queue.add(immutableStart);
-
-                  int coloredCount = 0;
-
-                  while (!queue.isEmpty() && visited.size() < MAX_TRACK_SEGMENTS) {
-                      BlockPos current = queue.poll();
-                      BlockState state = level.getBlockState(current);
-
-                      if (!(state.getBlock() instanceof ITrackBlock trackBlock)) {
-                          continue;
-                      }
-
-                      if (applyColorToPos(level, current, color)) {
-                          coloredCount++;
-                      }
-
-                      // 1. Traverse all logical track node connections (straight, diagonal, switches, slopes)
-                      Collection<? extends TrackNodeLocation> connectedNodes =
-                          trackBlock.getConnected(level, current, state, true, null);
-                      for (TrackNodeLocation nodeLoc : connectedNodes) {
-                          Vec3 vec = nodeLoc.getLocation();
-                          BlockPos candidate = BlockPos.containing(vec).immutable();
-                          enqueueIfTrack(level, candidate, visited, queue);
-                          enqueueIfTrack(level, candidate.above(), visited, queue);
-                          enqueueIfTrack(level, candidate.below(), visited, queue);
-                      }
-
-                      // 2. Traverse all curved Bezier track connections stored in TrackBlockEntity
-                      BlockEntity be = level.getBlockEntity(current);
-                      if (be instanceof TrackBlockEntity trackBE) {
-                          Map<BlockPos, BezierConnection> connections = trackBE.getConnections();
-                          for (BlockPos bezierTarget : connections.keySet()) {
-                              enqueueIfTrack(level, bezierTarget.immutable(), visited, queue);
+                          1 -> {
+                              s.x += s.dir * s.speed * dt
+                              val hit = !s.survives &&
+                                  ((s.dir > 0f && s.x >= s.sinkX) || (s.dir < 0f && s.x <= s.sinkX))
+                              if (hit) {
+                                  s.state = 2
+                                  s.timer = 0f
+                                  s.tiltDir = if (rnd.nextBoolean()) 1f else -1f
+                              } else if (s.x < -10f || s.x > wBlocks + 10f) {
+                                  s.state = 0
+                                  s.timer = 1f + rnd.nextFloat() * 3f
+                              }
                           }
-                      }
-
-                      // 3. Check directly adjacent track blocks on the same rail axis
-                      for (int dx = -1; dx <= 1; dx++) {
-                          for (int dy = -1; dy <= 1; dy++) {
-                              for (int dz = -1; dz <= 1; dz++) {
-                                  if (dx == 0 && dy == 0 && dz == 0) continue;
-                                  BlockPos neighbor = current.offset(dx, dy, dz).immutable();
-                                  if (visited.contains(neighbor)) continue;
-                                  BlockState neighborState = level.getBlockState(neighbor);
-                                  if (neighborState.getBlock() instanceof ITrackBlock neighborTrack) {
-                                      if (areTracksConnected(level, current, state, trackBlock, neighbor, neighborState, neighborTrack)) {
-                                          visited.add(neighbor);
-                                          queue.add(neighbor);
-                                      }
-                                  }
+                          else -> {
+                              s.timer += dt
+                              s.tilt = (s.tilt + s.tiltDir * (8f + s.timer * 6f) * dt).coerceIn(-85f, 85f)
+                              s.drop += (1.2f + s.timer * 1.1f) * dt
+                              s.x += s.dir * s.speed * 0.15f * dt
+                              if (rnd.nextFloat() < dt * 14f) {
+                                  addBubble(s.x + (rnd.nextFloat() - 0.5f) * 4f * s.scale, -s.drop + 1f)
+                              }
+                              if (s.drop > 16f) {
+                                  s.state = 0
+                                  s.timer = 1f + rnd.nextFloat() * 3f
+                                  s.tilt = 0f; s.drop = 0f
                               }
                           }
                       }
                   }
+                  for (i in bl.indices) {
+                      if (bl[i] > 0f) {
+                          bl[i] -= dt
+                          by[i] += 3f * dt
+                          bx[i] += sin(time * 3f + i) * 0.4f * dt
+                          if (by[i] > 0f) bl[i] = 0f
+                      }
+                  }
+              }
+          }
 
-                  return coloredCount;
+          private val SCALES = floatArrayOf(0.6f, 0.8f, 1f)
+
+          private val PALETTES = arrayOf(
+              arrayOf(Color(0xFF5B3A1E), Color(0xFF8B5A2B), Color(0xFFEDE6D3), Color(0xFFC0392B)),
+              arrayOf(Color(0xFF3E2A1A), Color(0xFF6F4E37), Color(0xFFD9D2C0), Color(0xFF2E86C1)),
+              arrayOf(Color(0xFF4A3B2A), Color(0xFF9C6B3A), Color(0xFFF4EBD0), Color(0xFFF1C40F))
+          )
+          private val SAIL_SHADE = Color(0x22000000)
+
+          // x, y(up), width, height, colour index (0 wood, 1 deck, 2 sail, 3 flag, 4 shade)
+          private val SHIP = arrayOf(
+              intArrayOf(2, 0, 7, 1, 0),
+              intArrayOf(1, 1, 9, 1, 0),
+              intArrayOf(0, 2, 11, 1, 1),
+              intArrayOf(0, 3, 2, 1, 0),
+              intArrayOf(10, 3, 1, 2, 0),
+              intArrayOf(2, 4, 7, 7, 2),
+              intArrayOf(2, 7, 7, 1, 4),
+              intArrayOf(5, 3, 1, 10, 0),
+              intArrayOf(1, 11, 9, 1, 1),
+              intArrayOf(6, 12, 3, 1, 3)
+          )
+
+          private val MOON_ROWS = intArrayOf(1, 2, 3, 3, 3, 2, 1)
+
+          private fun DrawScope.drawShip(s: Ship, b: Float, seaY: Float) {
+              val bs = b * s.scale
+              val cx = s.x * b
+              val baseY = seaY + bs * 1.2f + s.drop * b
+              val pal = PALETTES[s.palette]
+              rotate(s.tilt, Offset(cx, baseY - bs * 2f)) {
+                  for (r in SHIP) {
+                      val x0 = if (s.dir > 0f) r[0] else 11 - r[0] - r[2]
+                      val color = when (r[4]) {
+                          0 -> pal[0]
+                          1 -> pal[1]
+                          2 -> pal[2]
+                          3 -> pal[3]
+                          else -> SAIL_SHADE
+                      }
+                      drawRect(
+                          color,
+                          Offset(cx + (x0 - 5.5f) * bs, baseY - (r[1] + r[3]) * bs),
+                          Size(r[2] * bs + 0.5f, r[3] * bs + 0.5f)
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun ShipsLayer() {
+              val world = remember { World() }
+              var tick by remember { mutableLongStateOf(0L) }
+
+              LaunchedEffect(Unit) {
+                  var last = 0L
+                  while (true) {
+                      withFrameNanos { now ->
+                          if (last == 0L) last = now
+                          val dt = (now - last) / 1_000_000_000f
+                          if (dt >= 1f / 30f) {   // 30 FPS cap keeps the launcher light
+                              last = now
+                              world.update(min(dt, 0.1f))
+                              tick = now
+                          }
+                      }
+                  }
               }
 
-              private static boolean areTracksConnected(
-                  Level level,
-                  BlockPos posA, BlockState stateA, ITrackBlock trackA,
-                  BlockPos posB, BlockState stateB, ITrackBlock trackB
-              ) {
-                  Vec3 centerA = Vec3.atCenterOf(posA);
-                  Vec3 centerB = Vec3.atCenterOf(posB);
-                  Vec3 delta = centerB.subtract(centerA).normalize();
+              Box(
+                  Modifier.fillMaxSize().drawWithCache {
+                      val w = size.width
+                      val h = size.height
+                      val b = h / 30f
+                      val seaY = h * 0.6f
+                      world.wBlocks = w / b
+                      val sky = Brush.verticalGradient(
+                          listOf(Color(0xFF070B24), Color(0xFF16345A), Color(0xFF3A6B8C)), 0f, seaY
+                      )
+                      val sea = Brush.verticalGradient(
+                          listOf(Color(0xFF1E5F86), Color(0xFF0B2A45), Color(0xFF06182B)), seaY, h
+                      )
+                      val cols = (w / b).toInt() + 2
+                      val front = seaY + b * 0.3f
+                      onDrawBehind {
+                          @Suppress("UNUSED_VARIABLE") val frame = tick
+                          val t = world.time
 
-                  for (Vec3 axisA : trackA.getTrackAxes(level, posA, stateA)) {
-                      Vec3 normA = axisA.normalize();
-                      if (Math.abs(normA.dot(delta)) > 0.85) {
-                          for (Vec3 axisB : trackB.getTrackAxes(level, posB, stateB)) {
-                              Vec3 normB = axisB.normalize();
-                              if (Math.abs(normA.dot(normB)) > 0.70) {
-                                  return true;
+                          drawRect(sky, size = Size(w, seaY))
+                          for (i in world.starX.indices) {
+                              val a = 0.4f + 0.6f * abs(sin(t * 0.8f + world.starP[i]))
+                              drawRect(
+                                  Color.White.copy(alpha = a),
+                                  Offset(world.starX[i] * w, world.starY[i] * seaY * 0.7f),
+                                  Size(b * 0.3f, b * 0.3f)
+                              )
+                          }
+                          val mx = w * 0.82f
+                          val my = h * 0.17f
+                          val mu = b * 0.6f
+                          for (r in MOON_ROWS.indices) {
+                              val hw = MOON_ROWS[r]
+                              drawRect(
+                                  Color(0xFFF3EFD2),
+                                  Offset(mx - hw * mu, my + (r - 3) * mu),
+                                  Size(2 * hw * mu, mu)
+                              )
+                          }
+
+                          drawRect(sea, Offset(0f, seaY), Size(w, h - seaY))
+                          for (i in 0 until cols) {
+                              val k = (sin(i * 0.55f + t * 1.4f) * 1.4f).roundToInt()
+                              drawRect(
+                                  Color(0x55BFE3F2),
+                                  Offset(i * b, seaY + k * b * 0.5f - b * 0.5f),
+                                  Size(b, b * 0.5f)
+                              )
+                          }
+
+                          for (s in world.ships) if (s.state != 0) drawShip(s, b, seaY)
+
+                          drawRect(Color(0x88104A6E), Offset(0f, front), Size(w, h - front))
+                          for (i in 0 until cols) {
+                              val k = (sin(i * 0.6f - t * 1.7f + 1.3f) * 1.4f).roundToInt()
+                              drawRect(
+                                  Color(0x99D8F1FA),
+                                  Offset(i * b, front + k * b * 0.5f - b * 0.5f),
+                                  Size(b, b * 0.5f)
+                              )
+                          }
+
+                          for (i in world.bl.indices) {
+                              if (world.bl[i] > 0f) {
+                                  drawRect(
+                                      Color(0xAAE8F8FF),
+                                      Offset(world.bx[i] * b, seaY - world.by[i] * b),
+                                      Size(b * 0.3f, b * 0.3f)
+                                  )
                               }
                           }
                       }
                   }
-                  return false;
-              }
-
-              private static void enqueueIfTrack(Level level, BlockPos pos, Set<BlockPos> visited, Queue<BlockPos> queue) {
-                  if (!visited.contains(pos) && level.getBlockState(pos).getBlock() instanceof ITrackBlock) {
-                      visited.add(pos);
-                      queue.add(pos);
-                  }
-              }
-
-              public static boolean applyColorToPos(Level level, BlockPos pos, DyeColor color) {
-                  BlockEntity be = level.getBlockEntity(pos);
-                  if (be instanceof ColorHolder holder) {
-                      DyeColor existing = holder.createdyedtracks$getDyedColor();
-                      if (existing == color) {
-                          return false;
-                      }
-                      holder.createdyedtracks$setDyedColor(color);
-                      be.setChanged();
-                      BlockState state = level.getBlockState(pos);
-                      level.sendBlockUpdated(pos, state, state, 3);
-                      if (level instanceof ServerLevel serverLevel) {
-                          PacketDistributor.sendToPlayersTrackingChunk(
-                              serverLevel,
-                              serverLevel.getChunkAt(pos).getPos(),
-                              SyncDyeColorPayload.of(pos, color)
-                          );
-                      }
-                      return true;
-                  }
-                  return false;
-              }
+              ) {}
           }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/DyeInteractionHandler.java
-          package com.createdyedtracks;
-
-          import com.simibubi.create.content.trains.bogey.AbstractBogeyBlock;
-          import com.simibubi.create.content.trains.bogey.AbstractBogeyBlockEntity;
-          import com.simibubi.create.content.trains.entity.CarriageBogey;
-          import com.simibubi.create.content.trains.entity.CarriageContraptionEntity;
-          import com.simibubi.create.content.trains.track.ITrackBlock;
-          import net.minecraft.core.BlockPos;
-          import net.minecraft.core.particles.DustParticleOptions;
-          import net.minecraft.server.level.ServerLevel;
-          import net.minecraft.sounds.SoundEvents;
-          import net.minecraft.sounds.SoundSource;
-          import net.minecraft.world.InteractionResult;
-          import net.minecraft.world.entity.player.Player;
-          import net.minecraft.world.item.DyeColor;
-          import net.minecraft.world.item.DyeItem;
-          import net.minecraft.world.item.ItemStack;
-          import net.minecraft.world.level.Level;
-          import net.minecraft.world.level.block.entity.BlockEntity;
-          import net.minecraft.world.level.block.state.BlockState;
-          import net.minecraft.world.phys.Vec3;
-          import net.neoforged.bus.api.SubscribeEvent;
-          import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
-          import net.neoforged.neoforge.network.PacketDistributor;
-          import org.joml.Vector3f;
-
-          public class DyeInteractionHandler {
-
-              @SubscribeEvent
-              public void onRightClickBlock(PlayerInteractEvent.RightClickBlock event) {
-                  ItemStack stack = event.getItemStack();
-                  if (!(stack.getItem() instanceof DyeItem dyeItem)) {
-                      return;
-                  }
-
-                  Player player = event.getEntity();
-                  Level level = event.getLevel();
-                  BlockPos pos = event.getPos();
-                  BlockState state = level.getBlockState(pos);
-                  DyeColor dyeColor = dyeItem.getDyeColor();
-
-                  // 1. Normal right-click on a Bogey block -> Color the bogey's wheels
-                  if (state.getBlock() instanceof AbstractBogeyBlock<?> && !player.isShiftKeyDown()) {
-                      BlockEntity be = level.getBlockEntity(pos);
-                      if (be instanceof AbstractBogeyBlockEntity && be instanceof ColorHolder holder) {
-                          if (!level.isClientSide) {
-                              holder.createdyedtracks$setDyedColor(dyeColor);
-                              be.setChanged();
-                              level.sendBlockUpdated(pos, state, state, 3);
-                              if (level instanceof ServerLevel serverLevel) {
-                                  PacketDistributor.sendToPlayersTrackingChunk(
-                                      serverLevel,
-                                      serverLevel.getChunkAt(pos).getPos(),
-                                      SyncDyeColorPayload.of(pos, dyeColor)
-                                  );
-                                  spawnDyeParticles(serverLevel, Vec3.atCenterOf(pos), dyeColor, 12);
-                              }
-                              level.playSound(null, pos, SoundEvents.DYE_USE, SoundSource.BLOCKS, 1.0F, 1.0F);
-                              if (!player.getAbilities().instabuild) {
-                                  stack.shrink(1);
-                              }
-                          }
-                          event.setCanceled(true);
-                          event.setCancellationResult(InteractionResult.sidedSuccess(level.isClientSide));
-                      }
-                      return;
-                  }
-
-                  // 2. Click on Train Tracks -> Shift-click colors entire connected line; normal click colors single track
-                  if (state.getBlock() instanceof ITrackBlock) {
-                      if (!level.isClientSide) {
-                          int colored = player.isShiftKeyDown()
-                              ? TrackNetworkColorer.colorConnectedLine(level, pos, dyeColor)
-                              : TrackNetworkColorer.colorSingleTrack(level, pos, dyeColor);
-
-                          if (colored > 0) {
-                              level.playSound(null, pos, SoundEvents.DYE_USE, SoundSource.BLOCKS, 1.0F, 1.0F);
-                              if (level instanceof ServerLevel serverLevel) {
-                                  spawnDyeParticles(serverLevel, Vec3.atCenterOf(pos), dyeColor, player.isShiftKeyDown() ? 24 : 10);
-                              }
-                              if (!player.getAbilities().instabuild) {
-                                  stack.shrink(1);
-                              }
-                          }
-                      }
-                      event.setCanceled(true);
-                      event.setCancellationResult(InteractionResult.sidedSuccess(level.isClientSide));
-                  }
-              }
-
-              @SubscribeEvent
-              public void onInteractEntity(PlayerInteractEvent.EntityInteract event) {
-                  ItemStack stack = event.getItemStack();
-                  if (!(stack.getItem() instanceof DyeItem dyeItem)) {
-                      return;
-                  }
-
-                  Player player = event.getEntity();
-                  if (player.isShiftKeyDown()) {
-                      return;
-                  }
-
-                  if (event.getTarget() instanceof CarriageContraptionEntity carriageEntity) {
-                      Level level = event.getLevel();
-                      DyeColor dyeColor = dyeItem.getDyeColor();
-
-                      if (carriageEntity.getCarriage() != null) {
-                          Vec3 hitPos = player.getEyePosition().add(player.getLookAngle().scale(2.5));
-                          CarriageBogey closestBogey = null;
-                          double bestDistSq = Double.MAX_VALUE;
-
-                          for (CarriageBogey bogey : carriageEntity.getCarriage().bogeys) {
-                              if (bogey == null || bogey.getAnchorPosition() == null) continue;
-                              double distSq = bogey.getAnchorPosition().distanceToSqr(hitPos);
-                              if (distSq < bestDistSq) {
-                                  bestDistSq = distSq;
-                                  closestBogey = bogey;
-                              }
-                          }
-
-                          if (closestBogey != null) {
-                              if (closestBogey instanceof ColorHolder bogeyHolder) {
-                                  bogeyHolder.createdyedtracks$setDyedColor(dyeColor);
-                              }
-                              if (!level.isClientSide) {
-                                  if (carriageEntity.getContraption() != null) {
-                                      for (BlockEntity be : carriageEntity.getContraption().presentBlockEntities.values()) {
-                                          if (be instanceof AbstractBogeyBlockEntity && be instanceof ColorHolder holder) {
-                                              holder.createdyedtracks$setDyedColor(dyeColor);
-                                              be.setChanged();
-                                          }
-                                      }
-                                  }
-                                  level.playSound(null, carriageEntity.blockPosition(), SoundEvents.DYE_USE, SoundSource.NEUTRAL, 1.0F, 1.0F);
-                                  if (level instanceof ServerLevel serverLevel) {
-                                      spawnDyeParticles(serverLevel, hitPos, dyeColor, 14);
-                                  }
-                                  if (!player.getAbilities().instabuild) {
-                                      stack.shrink(1);
-                                  }
-                              }
-                          }
-                      }
-
-                      event.setCanceled(true);
-                      event.setCancellationResult(InteractionResult.sidedSuccess(level.isClientSide));
-                  }
-              }
-
-              private static void spawnDyeParticles(ServerLevel level, Vec3 pos, DyeColor color, int count) {
-                  int rgb = color.getTextureDiffuseColor();
-                  float r = ((rgb >> 16) & 0xFF) / 255.0F;
-                  float g = ((rgb >> 8) & 0xFF) / 255.0F;
-                  float b = (rgb & 0xFF) / 255.0F;
-                  level.sendParticles(
-                      new DustParticleOptions(new Vector3f(r, g, b), 1.25F),
-                      pos.x, pos.y + 0.35, pos.z,
-                      count, 0.35, 0.2, 0.35, 0.02
-                  );
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/AbstractBogeyBlockEntityMixin.java
-          package com.createdyedtracks.mixin;
-
-          import com.createdyedtracks.ColorHolder;
-          import com.simibubi.create.content.trains.bogey.AbstractBogeyBlockEntity;
-          import net.minecraft.core.HolderLookup;
-          import net.minecraft.nbt.CompoundTag;
-          import net.minecraft.world.item.DyeColor;
-          import org.jetbrains.annotations.Nullable;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.Unique;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-          @Mixin(AbstractBogeyBlockEntity.class)
-          public abstract class AbstractBogeyBlockEntityMixin implements ColorHolder {
-              @Unique
-              @Nullable
-              private DyeColor createdyedtracks$dyedColor;
-
-              @Override
-              @Nullable
-              public DyeColor createdyedtracks$getDyedColor() {
-                  return this.createdyedtracks$dyedColor;
-              }
-
-              @Override
-              public void createdyedtracks$setDyedColor(@Nullable DyeColor color) {
-                  this.createdyedtracks$dyedColor = color;
-              }
-
-              @Inject(method = "write", at = @At("TAIL"), remap = false)
-              private void createdyedtracks$writeColor(CompoundTag tag, HolderLookup.Provider registries, boolean clientPacket, CallbackInfo ci) {
-                  if (this.createdyedtracks$dyedColor != null) {
-                      tag.putString("CreateDyedTracksWheelColor", this.createdyedtracks$dyedColor.getName());
-                  }
-              }
-
-              @Inject(method = "read", at = @At("TAIL"), remap = false)
-              private void createdyedtracks$readColor(CompoundTag tag, HolderLookup.Provider registries, boolean clientPacket, CallbackInfo ci) {
-                  if (tag.contains("CreateDyedTracksWheelColor")) {
-                      this.createdyedtracks$dyedColor = DyeColor.byName(tag.getString("CreateDyedTracksWheelColor"), null);
-                  } else {
-                      this.createdyedtracks$dyedColor = null;
-                  }
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/CarriageBogeyMixin.java
-          package com.createdyedtracks.mixin;
-
-          import com.createdyedtracks.ColorHolder;
-          import com.simibubi.create.content.trains.entity.CarriageBogey;
-          import net.minecraft.nbt.CompoundTag;
-          import net.minecraft.world.item.DyeColor;
-          import org.jetbrains.annotations.Nullable;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.Shadow;
-
-          @Mixin(CarriageBogey.class)
-          public abstract class CarriageBogeyMixin implements ColorHolder {
-              @Shadow(remap = false)
-              private CompoundTag bogeyData;
-
-              @Override
-              @Nullable
-              public DyeColor createdyedtracks$getDyedColor() {
-                  if (this.bogeyData != null && this.bogeyData.contains("CreateDyedTracksWheelColor")) {
-                      return DyeColor.byName(this.bogeyData.getString("CreateDyedTracksWheelColor"), null);
-                  }
-                  return null;
-              }
-
-              @Override
-              public void createdyedtracks$setDyedColor(@Nullable DyeColor color) {
-                  if (this.bogeyData == null) {
-                      this.bogeyData = new CompoundTag();
-                  }
-                  if (color == null) {
-                      this.bogeyData.remove("CreateDyedTracksWheelColor");
-                  } else {
-                      this.bogeyData.putString("CreateDyedTracksWheelColor", color.getName());
-                  }
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/TrackBlockEntityMixin.java
-          package com.createdyedtracks.mixin;
-
-          import com.createdyedtracks.ColorHolder;
-          import com.simibubi.create.content.trains.track.TrackBlockEntity;
-          import net.minecraft.core.HolderLookup;
-          import net.minecraft.nbt.CompoundTag;
-          import net.minecraft.world.item.DyeColor;
-          import org.jetbrains.annotations.Nullable;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.Unique;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-          @Mixin(TrackBlockEntity.class)
-          public abstract class TrackBlockEntityMixin implements ColorHolder {
-              @Unique
-              @Nullable
-              private DyeColor createdyedtracks$dyedColor;
-
-              @Override
-              @Nullable
-              public DyeColor createdyedtracks$getDyedColor() {
-                  return this.createdyedtracks$dyedColor;
-              }
-
-              @Override
-              public void createdyedtracks$setDyedColor(@Nullable DyeColor color) {
-                  this.createdyedtracks$dyedColor = color;
-              }
-
-              @Inject(method = "write", at = @At("TAIL"), remap = false)
-              private void createdyedtracks$writeColor(CompoundTag tag, HolderLookup.Provider registries, boolean clientPacket, CallbackInfo ci) {
-                  if (this.createdyedtracks$dyedColor != null) {
-                      tag.putString("CreateDyedTracksRailColor", this.createdyedtracks$dyedColor.getName());
-                  }
-              }
-
-              @Inject(method = "read", at = @At("TAIL"), remap = false)
-              private void createdyedtracks$readColor(CompoundTag tag, HolderLookup.Provider registries, boolean clientPacket, CallbackInfo ci) {
-                  if (tag.contains("CreateDyedTracksRailColor")) {
-                      this.createdyedtracks$dyedColor = DyeColor.byName(tag.getString("CreateDyedTracksRailColor"), null);
-                  } else {
-                      this.createdyedtracks$dyedColor = null;
-                  }
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/client/BogeyBlockEntityRendererMixin.java
-          package com.createdyedtracks.mixin.client;
-
-          import com.createdyedtracks.ColorHolder;
-          import com.createdyedtracks.RenderColorContext;
-          import com.mojang.blaze3d.vertex.PoseStack;
-          import com.simibubi.create.content.trains.bogey.AbstractBogeyBlockEntity;
-          import com.simibubi.create.content.trains.bogey.BogeyBlockEntityRenderer;
-          import net.minecraft.client.renderer.MultiBufferSource;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-          @Mixin(BogeyBlockEntityRenderer.class)
-          public class BogeyBlockEntityRendererMixin {
-
-              @Inject(method = "renderSafe", at = @At("HEAD"), remap = false, require = 0)
-              private void createdyedtracks$beginBogeyRender(
-                  AbstractBogeyBlockEntity be, float partialTicks, PoseStack ms,
-                  MultiBufferSource buffer, int light, int overlay, CallbackInfo ci
-              ) {
-                  if (be instanceof ColorHolder holder) {
-                      RenderColorContext.setBogeyColor(holder.createdyedtracks$getDyedColor());
-                  }
-              }
-
-              @Inject(method = "renderSafe", at = @At("RETURN"), remap = false, require = 0)
-              private void createdyedtracks$endBogeyRender(
-                  AbstractBogeyBlockEntity be, float partialTicks, PoseStack ms,
-                  MultiBufferSource buffer, int light, int overlay, CallbackInfo ci
-              ) {
-                  RenderColorContext.setBogeyColor(null);
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/client/BogeyRendererMixin.java
-          package com.createdyedtracks.mixin.client;
-
-          import com.createdyedtracks.RenderColorContext;
-          import com.mojang.blaze3d.vertex.PoseStack;
-          import com.simibubi.create.content.trains.bogey.BogeyRenderer;
-          import net.minecraft.client.renderer.MultiBufferSource;
-          import net.minecraft.nbt.CompoundTag;
-          import net.minecraft.world.item.DyeColor;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-          @Mixin(BogeyRenderer.class)
-          public class BogeyRendererMixin {
-
-              @Inject(method = "render", at = @At("HEAD"), remap = false, require = 0)
-              private void createdyedtracks$readBogeyDataColor(
-                  CompoundTag bogeyData, float wheelAngle, float partialTick,
-                  PoseStack poseStack, MultiBufferSource bufferSource,
-                  int packedLight, int packedOverlay, boolean inContraption, CallbackInfo ci
-              ) {
-                  if (bogeyData != null && bogeyData.contains("CreateDyedTracksWheelColor")) {
-                      DyeColor color = DyeColor.byName(bogeyData.getString("CreateDyedTracksWheelColor"), null);
-                      if (color != null) {
-                          RenderColorContext.setBogeyColor(color);
-                      }
-                  }
-              }
-
-              @Inject(method = "render", at = @At("RETURN"), remap = false, require = 0)
-              private void createdyedtracks$clearBogeyDataColor(
-                  CompoundTag bogeyData, float wheelAngle, float partialTick,
-                  PoseStack poseStack, MultiBufferSource bufferSource,
-                  int packedLight, int packedOverlay, boolean inContraption, CallbackInfo ci
-              ) {
-                  RenderColorContext.setBogeyColor(null);
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/client/CachedBuffersMixin.java
-          package com.createdyedtracks.mixin.client;
-
-          import com.createdyedtracks.RenderColorContext;
-          import com.simibubi.create.AllPartialModels;
-          import dev.engine_room.flywheel.lib.model.baked.PartialModel;
-          import net.createmod.catnip.render.CachedBuffers;
-          import net.createmod.catnip.render.SuperByteBuffer;
-          import net.minecraft.world.item.DyeColor;
-          import net.minecraft.world.level.block.state.BlockState;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
-
-          import java.util.Locale;
-
-          @Mixin(CachedBuffers.class)
-          public class CachedBuffersMixin {
-
-              @Inject(
-                  method = "partial(Ldev/engine_room/flywheel/lib/model/baked/PartialModel;Lnet/minecraft/world/level/block/state/BlockState;)Lnet/createmod/catnip/render/SuperByteBuffer;",
-                  at = @At("RETURN"),
-                  remap = false,
-                  require = 0
-              )
-              private static void createdyedtracks$tintBogeyWheelsOnly(
-                  PartialModel partial, BlockState referenceState, CallbackInfoReturnable<SuperByteBuffer> cir
-              ) {
-                  DyeColor color = RenderColorContext.getBogeyColor();
-                  if (color != null && createdyedtracks$isWheelPartial(partial)) {
-                      SuperByteBuffer buffer = cir.getReturnValue();
-                      if (buffer != null) {
-                          buffer.color(RenderColorContext.getVibrantRgb(color));
-                      }
-                  }
-              }
-
-              private static boolean createdyedtracks$isWheelPartial(PartialModel partial) {
-                  if (partial == null) return false;
-                  if (partial == AllPartialModels.SMALL_BOGEY_WHEELS
-                      || partial == AllPartialModels.LARGE_BOGEY_WHEELS) {
-                      return true;
-                  }
-                  String desc = partial.toString().toLowerCase(Locale.ROOT);
-                  return desc.contains("wheel") || desc.contains("drive");
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/client/TrackRendererMixin.java
-          package com.createdyedtracks.mixin.client;
-
-          import com.createdyedtracks.ColorHolder;
-          import com.createdyedtracks.RenderColorContext;
-          import com.mojang.blaze3d.vertex.PoseStack;
-          import com.simibubi.create.content.trains.track.TrackBlockEntity;
-          import com.simibubi.create.content.trains.track.TrackRenderer;
-          import net.minecraft.client.renderer.MultiBufferSource;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-          @Mixin(TrackRenderer.class)
-          public class TrackRendererMixin {
-
-              @Inject(method = "renderSafe", at = @At("HEAD"), remap = false, require = 0)
-              private void createdyedtracks$beginTrackRender(
-                  TrackBlockEntity be, float partialTicks, PoseStack ms,
-                  MultiBufferSource buffer, int light, int overlay, CallbackInfo ci
-              ) {
-                  if (be instanceof ColorHolder holder) {
-                      RenderColorContext.setTrackColor(holder.createdyedtracks$getDyedColor());
-                  }
-              }
-
-              @Inject(method = "renderSafe", at = @At("RETURN"), remap = false, require = 0)
-              private void createdyedtracks$endTrackRender(
-                  TrackBlockEntity be, float partialTicks, PoseStack ms,
-                  MultiBufferSource buffer, int light, int overlay, CallbackInfo ci
-              ) {
-                  RenderColorContext.setTrackColor(null);
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/client/TrackVisualMixin.java
-          package com.createdyedtracks.mixin.client;
-
-          import com.createdyedtracks.ColorHolder;
-          import com.createdyedtracks.RenderColorContext;
-          import com.simibubi.create.content.trains.track.TrackBlockEntity;
-          import com.simibubi.create.content.trains.track.TrackVisual;
-          import dev.engine_room.flywheel.api.visualization.VisualizationContext;
-          import dev.engine_room.flywheel.lib.visual.AbstractBlockEntityVisual;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-          @Mixin(TrackVisual.class)
-          public abstract class TrackVisualMixin extends AbstractBlockEntityVisual<TrackBlockEntity> {
-
-              public TrackVisualMixin(VisualizationContext context, TrackBlockEntity blockEntity, float partialTick) {
-                  super(context, blockEntity, partialTick);
-              }
-
-              @Inject(method = "update", at = @At("HEAD"), remap = false, require = 0)
-              private void createdyedtracks$beginVisualUpdate(float pt, CallbackInfo ci) {
-                  if (this.blockEntity instanceof ColorHolder holder) {
-                      RenderColorContext.setTrackColor(holder.createdyedtracks$getDyedColor());
-                  }
-              }
-
-              @Inject(method = "update", at = @At("RETURN"), remap = false, require = 0)
-              private void createdyedtracks$endVisualUpdate(float pt, CallbackInfo ci) {
-                  RenderColorContext.setTrackColor(null);
-              }
-          }
-          EOF
-
-          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/client/SuperByteBufferMixin.java
-          package com.createdyedtracks.mixin.client;
-
-          import com.createdyedtracks.RenderColorContext;
-          import com.mojang.blaze3d.vertex.PoseStack;
-          import com.mojang.blaze3d.vertex.VertexConsumer;
-          import net.createmod.catnip.render.SuperByteBuffer;
-          import net.minecraft.world.item.DyeColor;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.Shadow;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-          @Mixin(SuperByteBuffer.class)
-          public abstract class SuperByteBufferMixin {
-
-              @Shadow(remap = false)
-              public abstract SuperByteBuffer color(int color);
-
-              @Inject(method = "renderInto", at = @At("HEAD"), remap = false, require = 0)
-              private void createdyedtracks$applyActiveTrackTint(PoseStack input, VertexConsumer builder, CallbackInfo ci) {
-                  DyeColor trackColor = RenderColorContext.getTrackColor();
-                  if (trackColor != null) {
-                      this.color(RenderColorContext.getVibrantRgb(trackColor));
-                  }
-              }
-          }
-          EOF
-
-      - name: Build Mod JAR
-        run: gradle build --no-daemon --stacktrace
-
-      - name: Upload Compiled Mod JAR
-        uses: actions/upload-artifact@v4
+          KT
+          python3 - "$MAIN" << 'PY'
+          import re, sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text(encoding="utf-8")
+          if "ShipsLayer" in s:
+              print("already patched")
+          else:
+              s2, n = re.subn(r"setContent\s*\{", "setContent {\n            net.shipsink.ShipsLayer()", s, count=1)
+              if n == 0:
+                  print("::warning::could not patch setContent")
+              else:
+                  p.write_text(s2, encoding="utf-8")
+                  print("patched", p)
+          PY
+
+      - name: Build release APK
+        working-directory: src
+        env:
+          CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace || ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Sign APK
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          keytool -genkeypair -keystore ks.jks -alias ship -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android -dname "CN=ShipLauncher"
+          mkdir -p out
+          find src -path '*/build/outputs/apk/*' -name '*.apk' | while read -r f; do
+            n=$(basename "$f" .apk)
+            "$BT/zipalign" -p 4 "$f" "out/$n-aligned.apk"
+            "$BT/apksigner" sign --ks ks.jks --ks-pass pass:android --key-pass pass:android \
+              --out "out/ShipLauncher-$n.apk" "out/$n-aligned.apk"
+            rm "out/$n-aligned.apk"
+          done
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: create-dyed-bogies-tracks-1.21.1
-          path: build/libs/*.jar
-          if-no-files-found: error
+          name: ship-launcher-apk
+          path: out/*.apk
