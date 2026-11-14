@@ -25,6 +25,7 @@ jobs:
 
       - name: Generate Mod Project Structure
         run: |
+          mkdir -p src/main/java/com/createdyedtracks/client
           mkdir -p src/main/java/com/createdyedtracks/mixin/client
           mkdir -p src/main/resources/META-INF
 
@@ -88,8 +89,16 @@ jobs:
                   url = 'https://maven.createmod.net'
               }
               maven {
-                  name = 'Tterrag Maven'
-                  url = 'https://maven.tterrag.com'
+                  name = 'ithundxr Mirror'
+                  url = 'https://maven.ithundxr.dev/mirror'
+              }
+              maven {
+                  name = 'devOS Snapshots'
+                  url = 'https://mvn.devos.one/snapshots'
+              }
+              maven {
+                  name = 'devOS Releases'
+                  url = 'https://mvn.devos.one/releases'
               }
           }
 
@@ -98,9 +107,9 @@ jobs:
                   transitive = false
               }
               implementation("net.createmod.ponder:Ponder-NeoForge-1.21.1:1.0.+")
+              implementation("dev.engine-room.flywheel:flywheel-neoforge-1.21.1:1.0.+")
               compileOnly("dev.engine-room.flywheel:flywheel-neoforge-api-1.21.1:1.0.+")
-              runtimeOnly("dev.engine-room.flywheel:flywheel-neoforge-1.21.1:1.0.+")
-              implementation("com.tterrag.registrate:Registrate:MC1.21-1.3.0+62")
+              compileOnly("com.tterrag.registrate:Registrate:MC1.21-1.3.+")
           }
 
           tasks.withType(JavaCompile).configureEach {
@@ -155,6 +164,7 @@ jobs:
             "compatibilityLevel": "JAVA_21",
             "mixins": [
               "AbstractBogeyBlockEntityMixin",
+              "CarriageBogeyMixin",
               "TrackBlockEntityMixin"
             ],
             "client": [
@@ -257,19 +267,46 @@ jobs:
           }
           EOF
 
+          cat << 'EOF' > src/main/java/com/createdyedtracks/client/ClientPacketHandler.java
+          package com.createdyedtracks.client;
+
+          import com.createdyedtracks.ColorHolder;
+          import com.createdyedtracks.SyncDyeColorPayload;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.world.item.DyeColor;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.block.entity.BlockEntity;
+
+          public final class ClientPacketHandler {
+              private ClientPacketHandler() {}
+
+              public static void handleSyncDyeColor(SyncDyeColorPayload payload) {
+                  Minecraft mc = Minecraft.getInstance();
+                  Level level = mc.level;
+                  if (level == null || !level.isLoaded(payload.pos())) {
+                      return;
+                  }
+                  BlockEntity be = level.getBlockEntity(payload.pos());
+                  if (be instanceof ColorHolder holder) {
+                      DyeColor dyeColor = payload.colorId() < 0 ? null : DyeColor.byId(payload.colorId());
+                      holder.createdyedtracks$setDyedColor(dyeColor);
+                      level.sendBlockUpdated(payload.pos(), be.getBlockState(), be.getBlockState(), 3);
+                  }
+              }
+          }
+          EOF
+
           cat << 'EOF' > src/main/java/com/createdyedtracks/SyncDyeColorPayload.java
           package com.createdyedtracks;
 
+          import com.createdyedtracks.client.ClientPacketHandler;
           import io.netty.buffer.ByteBuf;
-          import net.minecraft.client.Minecraft;
           import net.minecraft.core.BlockPos;
           import net.minecraft.network.codec.ByteBufCodecs;
           import net.minecraft.network.codec.StreamCodec;
           import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
           import net.minecraft.resources.ResourceLocation;
           import net.minecraft.world.item.DyeColor;
-          import net.minecraft.world.level.Level;
-          import net.minecraft.world.level.block.entity.BlockEntity;
           import net.neoforged.neoforge.network.handling.IPayloadContext;
           import org.jetbrains.annotations.Nullable;
 
@@ -295,19 +332,7 @@ jobs:
               }
 
               public static void handleClient(SyncDyeColorPayload payload, IPayloadContext context) {
-                  context.enqueueWork(() -> {
-                      Minecraft mc = Minecraft.getInstance();
-                      Level level = mc.level;
-                      if (level == null || !level.isLoaded(payload.pos())) {
-                          return;
-                      }
-                      BlockEntity be = level.getBlockEntity(payload.pos());
-                      if (be instanceof ColorHolder holder) {
-                          DyeColor dyeColor = payload.colorId() < 0 ? null : DyeColor.byId(payload.colorId());
-                          holder.createdyedtracks$setDyedColor(dyeColor);
-                          level.sendBlockUpdated(payload.pos(), be.getBlockState(), be.getBlockState(), 3);
-                      }
-                  });
+                  context.enqueueWork(() -> ClientPacketHandler.handleSyncDyeColor(payload));
               }
           }
           EOF
@@ -385,7 +410,6 @@ jobs:
                           Vec3 vec = nodeLoc.getLocation();
                           BlockPos candidate = BlockPos.containing(vec).immutable();
                           enqueueIfTrack(level, candidate, visited, queue);
-                          // Check immediate vertical neighbors for sloped track transitions
                           enqueueIfTrack(level, candidate.above(), visited, queue);
                           enqueueIfTrack(level, candidate.below(), visited, queue);
                       }
@@ -583,7 +607,7 @@ jobs:
                       Level level = event.getLevel();
                       DyeColor dyeColor = dyeItem.getDyeColor();
 
-                      if (!level.isClientSide && carriageEntity.getCarriage() != null) {
+                      if (carriageEntity.getCarriage() != null) {
                           Vec3 hitPos = player.getEyePosition().add(player.getLookAngle().scale(2.5));
                           CarriageBogey closestBogey = null;
                           double bestDistSq = Double.MAX_VALUE;
@@ -597,19 +621,26 @@ jobs:
                               }
                           }
 
-                          if (closestBogey != null && carriageEntity.getContraption() != null) {
-                              for (BlockEntity be : carriageEntity.getContraption().presentBlockEntities.values()) {
-                                  if (be instanceof AbstractBogeyBlockEntity && be instanceof ColorHolder holder) {
-                                      holder.createdyedtracks$setDyedColor(dyeColor);
-                                      be.setChanged();
+                          if (closestBogey != null) {
+                              if (closestBogey instanceof ColorHolder bogeyHolder) {
+                                  bogeyHolder.createdyedtracks$setDyedColor(dyeColor);
+                              }
+                              if (!level.isClientSide) {
+                                  if (carriageEntity.getContraption() != null) {
+                                      for (BlockEntity be : carriageEntity.getContraption().presentBlockEntities.values()) {
+                                          if (be instanceof AbstractBogeyBlockEntity && be instanceof ColorHolder holder) {
+                                              holder.createdyedtracks$setDyedColor(dyeColor);
+                                              be.setChanged();
+                                          }
+                                      }
                                   }
-                              }
-                              level.playSound(null, carriageEntity.blockPosition(), SoundEvents.DYE_USE, SoundSource.NEUTRAL, 1.0F, 1.0F);
-                              if (level instanceof ServerLevel serverLevel) {
-                                  spawnDyeParticles(serverLevel, hitPos, dyeColor, 14);
-                              }
-                              if (!player.getAbilities().instabuild) {
-                                  stack.shrink(1);
+                                  level.playSound(null, carriageEntity.blockPosition(), SoundEvents.DYE_USE, SoundSource.NEUTRAL, 1.0F, 1.0F);
+                                  if (level instanceof ServerLevel serverLevel) {
+                                      spawnDyeParticles(serverLevel, hitPos, dyeColor, 14);
+                                  }
+                                  if (!player.getAbilities().instabuild) {
+                                      stack.shrink(1);
+                                  }
                               }
                           }
                       }
@@ -678,6 +709,45 @@ jobs:
                       this.createdyedtracks$dyedColor = DyeColor.byName(tag.getString("CreateDyedTracksWheelColor"), null);
                   } else {
                       this.createdyedtracks$dyedColor = null;
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/createdyedtracks/mixin/CarriageBogeyMixin.java
+          package com.createdyedtracks.mixin;
+
+          import com.createdyedtracks.ColorHolder;
+          import com.simibubi.create.content.trains.entity.CarriageBogey;
+          import net.minecraft.nbt.CompoundTag;
+          import net.minecraft.world.item.DyeColor;
+          import org.jetbrains.annotations.Nullable;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Shadow;
+
+          @Mixin(CarriageBogey.class)
+          public abstract class CarriageBogeyMixin implements ColorHolder {
+              @Shadow(remap = false)
+              private CompoundTag bogeyData;
+
+              @Override
+              @Nullable
+              public DyeColor createdyedtracks$getDyedColor() {
+                  if (this.bogeyData != null && this.bogeyData.contains("CreateDyedTracksWheelColor")) {
+                      return DyeColor.byName(this.bogeyData.getString("CreateDyedTracksWheelColor"), null);
+                  }
+                  return null;
+              }
+
+              @Override
+              public void createdyedtracks$setDyedColor(@Nullable DyeColor color) {
+                  if (this.bogeyData == null) {
+                      this.bogeyData = new CompoundTag();
+                  }
+                  if (color == null) {
+                      this.bogeyData.remove("CreateDyedTracksWheelColor");
+                  } else {
+                      this.bogeyData.putString("CreateDyedTracksWheelColor", color.getName());
                   }
               }
           }
